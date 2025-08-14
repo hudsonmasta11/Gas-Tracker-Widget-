@@ -4,6 +4,7 @@
 (define-constant ERR_INVALID_AMOUNT (err u102))
 (define-constant ERR_ALREADY_EXISTS (err u103))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u104))
+(define-constant ERR_NO_RECOMMENDATIONS (err u105))
 
 (define-data-var total-transactions uint u0)
 (define-data-var total-gas-consumed uint u0)
@@ -49,6 +50,22 @@
     total-cost: uint
 })
 
+(define-map optimization-recommendations principal {
+    best-hour: uint,
+    potential-savings: uint,
+    confidence: uint,
+    last-updated: uint,
+    recommendation-count: uint
+})
+
+(define-map hourly-gas-patterns uint {
+    hour: uint,
+    avg-cost: uint,
+    tx-count: uint,
+    congestion-level: uint,
+    day-of-week: uint
+})
+
 (define-public (track-transaction (function-name (string-ascii 50)) (gas-estimate uint) (actual-cost uint))
     (let ((tx-id (var-get total-transactions))
           (current-block stacks-block-height)
@@ -69,6 +86,7 @@
             (update-user-stats tx-sender actual-cost)
             (update-function-stats function-name actual-cost)
             (update-daily-stats current-time actual-cost)
+            (update-hourly-patterns current-time actual-cost)
             
             (var-set total-transactions (+ tx-id u1))
             (var-set total-gas-consumed (+ (var-get total-gas-consumed) actual-cost))
@@ -272,5 +290,156 @@
                 }
             {user-avg: u0, global-avg: global-avg, percentile: u0}
         )
+    )
+)
+
+(define-private (update-hourly-patterns (timestamp uint) (gas-cost uint))
+    (let ((hour-key (mod (/ timestamp u6) u24))
+          (day-key (mod (/ timestamp u144) u7)))
+        (let ((current-hourly (default-to 
+                                {hour: hour-key, avg-cost: gas-cost, tx-count: u0, 
+                                 congestion-level: u0, day-of-week: day-key} 
+                                (map-get? hourly-gas-patterns hour-key))))
+            (let ((new-tx-count (+ (get tx-count current-hourly) u1))
+                  (total-cost (+ (* (get avg-cost current-hourly) (get tx-count current-hourly)) gas-cost)))
+                (map-set hourly-gas-patterns hour-key {
+                    hour: hour-key,
+                    avg-cost: (/ total-cost new-tx-count),
+                    tx-count: new-tx-count,
+                    congestion-level: (calculate-congestion-for-hour hour-key),
+                    day-of-week: day-key
+                })
+            )
+        )
+    )
+)
+
+(define-private (calculate-congestion-for-hour (hour uint))
+    (let ((recent-price-id (var-get total-transactions)))
+        (if (> recent-price-id u0)
+            (match (map-get? gas-price-history (- recent-price-id u1))
+                price-data (get network-congestion price-data)
+                u50)
+            u50)
+    )
+)
+
+(define-public (generate-optimization-recommendation (user principal))
+    (let ((user-data (map-get? user-stats user)))
+        (match user-data
+            stats
+                (let ((best-hour (find-optimal-hour))
+                      (current-avg (get avg-gas-per-tx stats))
+                      (optimal-cost (get-hour-avg-cost best-hour)))
+                    (let ((savings (if (> current-avg optimal-cost) 
+                                     (- current-avg optimal-cost) 
+                                     u0))
+                          (confidence (calculate-recommendation-confidence best-hour)))
+                        (begin
+                            (map-set optimization-recommendations user {
+                                best-hour: best-hour,
+                                potential-savings: savings,
+                                confidence: confidence,
+                                last-updated: burn-block-height,
+                                recommendation-count: (+ (get-user-recommendation-count user) u1)
+                            })
+                            (ok {
+                                best-hour: best-hour,
+                                potential-savings: savings,
+                                confidence: confidence
+                            })
+                        )
+                    )
+                )
+            ERR_NOT_FOUND
+        )
+    )
+)
+
+(define-private (find-optimal-hour)
+    (let ((hours (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23)))
+        (fold find-cheapest-hour hours u0)
+    )
+)
+
+(define-private (find-cheapest-hour (hour uint) (current-best uint))
+    (let ((hour-cost (get-hour-avg-cost hour))
+          (best-cost (get-hour-avg-cost current-best)))
+        (if (< hour-cost best-cost) hour current-best)
+    )
+)
+
+(define-private (get-hour-avg-cost (hour uint))
+    (match (map-get? hourly-gas-patterns hour)
+        pattern (get avg-cost pattern)
+        u999999
+    )
+)
+
+(define-private (calculate-recommendation-confidence (hour uint))
+    (match (map-get? hourly-gas-patterns hour)
+        pattern 
+            (let ((tx-count (get tx-count pattern)))
+                (if (> tx-count u20) u95
+                (if (> tx-count u10) u80
+                (if (> tx-count u5) u65 u40))))
+        u0
+    )
+)
+
+(define-private (get-user-recommendation-count (user principal))
+    (match (map-get? optimization-recommendations user)
+        rec (get recommendation-count rec)
+        u0
+    )
+)
+
+(define-read-only (get-optimization-recommendation (user principal))
+    (map-get? optimization-recommendations user)
+)
+
+(define-read-only (get-hourly-pattern (hour uint))
+    (map-get? hourly-gas-patterns hour)
+)
+
+(define-read-only (get-best-hours-ranking)
+    (let ((all-hours (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23)))
+        (map get-hour-ranking all-hours)
+    )
+)
+
+(define-private (get-hour-ranking (hour uint))
+    {
+        hour: hour,
+        avg-cost: (get-hour-avg-cost hour),
+        tx-count: (get-hour-tx-count hour),
+        congestion: (get-hour-congestion hour)
+    }
+)
+
+(define-private (get-hour-tx-count (hour uint))
+    (match (map-get? hourly-gas-patterns hour)
+        pattern (get tx-count pattern)
+        u0
+    )
+)
+
+(define-private (get-hour-congestion (hour uint))
+    (match (map-get? hourly-gas-patterns hour)
+        pattern (get congestion-level pattern)
+        u0
+    )
+)
+
+(define-read-only (calculate-potential-monthly-savings (user principal))
+    (match (map-get? user-stats user)
+        stats
+            (match (map-get? optimization-recommendations user)
+                rec
+                    (let ((monthly-txs (* (get transactions stats) u30))
+                          (savings-per-tx (get potential-savings rec)))
+                        (* monthly-txs savings-per-tx))
+                u0)
+        u0
     )
 )
