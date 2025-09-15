@@ -5,6 +5,8 @@
 (define-constant ERR_ALREADY_EXISTS (err u103))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u104))
 (define-constant ERR_NO_RECOMMENDATIONS (err u105))
+(define-constant ERR_BUDGET_EXCEEDED (err u106))
+(define-constant ERR_INVALID_PERIOD (err u107))
 
 (define-data-var total-transactions uint u0)
 (define-data-var total-gas-consumed uint u0)
@@ -66,6 +68,31 @@
     day-of-week: uint
 })
 
+(define-map user-budgets principal {
+    daily-limit: uint,
+    monthly-limit: uint,
+    alert-threshold: uint,
+    auto-restrict: bool,
+    created-at: uint
+})
+
+(define-map budget-tracking {user: principal, period: uint} {
+    period-start: uint,
+    period-end: uint,
+    total-spent: uint,
+    transaction-count: uint,
+    budget-exceeded: bool,
+    last-alert-sent: uint
+})
+
+(define-map budget-performance principal {
+    periods-tracked: uint,
+    periods-under-budget: uint,
+    total-saved: uint,
+    avg-utilization: uint,
+    best-period: uint
+})
+
 (define-public (track-transaction (function-name (string-ascii 50)) (gas-estimate uint) (actual-cost uint))
     (let ((tx-id (var-get total-transactions))
           (current-block stacks-block-height)
@@ -87,6 +114,7 @@
             (update-function-stats function-name actual-cost)
             (update-daily-stats current-time actual-cost)
             (update-hourly-patterns current-time actual-cost)
+            (try! (update-budget-tracking tx-sender actual-cost current-time))
             
             (var-set total-transactions (+ tx-id u1))
             (var-set total-gas-consumed (+ (var-get total-gas-consumed) actual-cost))
@@ -441,5 +469,202 @@
                         (* monthly-txs savings-per-tx))
                 u0)
         u0
+    )
+)
+
+(define-public (set-gas-budget (daily-limit uint) (monthly-limit uint) (alert-threshold uint) (auto-restrict bool))
+    (begin
+        (asserts! (> daily-limit u0) ERR_INVALID_AMOUNT)
+        (asserts! (> monthly-limit u0) ERR_INVALID_AMOUNT)
+        (asserts! (<= alert-threshold u100) ERR_INVALID_AMOUNT)
+        
+        (map-set user-budgets tx-sender {
+            daily-limit: daily-limit,
+            monthly-limit: monthly-limit,
+            alert-threshold: alert-threshold,
+            auto-restrict: auto-restrict,
+            created-at: burn-block-height
+        })
+        
+        (ok true)
+    )
+)
+
+(define-private (update-budget-tracking (user principal) (cost uint) (timestamp uint))
+    (let ((daily-period (/ timestamp u144))
+          (monthly-period (/ timestamp u4320)))
+        (begin
+            (try! (update-period-budget user cost daily-period u1))
+            (try! (update-period-budget user cost monthly-period u30))
+            (ok true)
+        )
+    )
+)
+
+(define-private (update-period-budget (user principal) (cost uint) (period uint) (period-type uint))
+    (let ((budget-key {user: user, period: period})
+          (user-budget (map-get? user-budgets user)))
+        (match user-budget
+            budget-info
+                (let ((limit (if (is-eq period-type u1) 
+                               (get daily-limit budget-info) 
+                               (get monthly-limit budget-info)))
+                      (current-tracking (default-to 
+                                          {period-start: period, period-end: (+ period period-type),
+                                           total-spent: u0, transaction-count: u0, 
+                                           budget-exceeded: false, last-alert-sent: u0}
+                                          (map-get? budget-tracking budget-key))))
+                    (let ((new-total (+ (get total-spent current-tracking) cost))
+                          (new-tx-count (+ (get transaction-count current-tracking) u1))
+                          (exceeds-budget (> new-total limit))
+                          (threshold-reached (> (* new-total u100) (* limit (get alert-threshold budget-info)))))
+                        (begin
+                            (map-set budget-tracking budget-key {
+                                period-start: (get period-start current-tracking),
+                                period-end: (get period-end current-tracking),
+                                total-spent: new-total,
+                                transaction-count: new-tx-count,
+                                budget-exceeded: exceeds-budget,
+                                last-alert-sent: (if threshold-reached burn-block-height (get last-alert-sent current-tracking))
+                            })
+                            
+                            (if (and (get auto-restrict budget-info) exceeds-budget)
+                                ERR_BUDGET_EXCEEDED
+                                (ok true))
+                        )
+                    )
+                )
+            (ok true)
+        )
+    )
+)
+
+(define-public (check-budget-status (user principal))
+    (let ((daily-period (/ burn-block-height u144))
+          (monthly-period (/ burn-block-height u4320)))
+        (match (map-get? user-budgets user)
+            budget
+                (let ((daily-tracking (map-get? budget-tracking {user: user, period: daily-period}))
+                      (monthly-tracking (map-get? budget-tracking {user: user, period: monthly-period})))
+                    (ok {
+                        daily-budget: (get daily-limit budget),
+                        monthly-budget: (get monthly-limit budget),
+                        daily-spent: (match daily-tracking t (get total-spent t) u0),
+                        monthly-spent: (match monthly-tracking t (get total-spent t) u0),
+                        daily-remaining: (- (get daily-limit budget) 
+                                           (match daily-tracking t (get total-spent t) u0)),
+                        monthly-remaining: (- (get monthly-limit budget) 
+                                             (match monthly-tracking t (get total-spent t) u0)),
+                        alert-threshold: (get alert-threshold budget)
+                    }))
+            ERR_NOT_FOUND
+        )
+    )
+)
+
+(define-public (update-budget-performance (user principal))
+    (let ((daily-period (/ burn-block-height u144))
+          (budget-key {user: user, period: daily-period}))
+        (match (map-get? budget-tracking budget-key)
+            tracking
+                (match (map-get? user-budgets user)
+                    budget
+                        (let ((current-perf (default-to 
+                                              {periods-tracked: u0, periods-under-budget: u0,
+                                               total-saved: u0, avg-utilization: u0, best-period: u0}
+                                              (map-get? budget-performance user)))
+                              (utilization (/ (* (get total-spent tracking) u100) (get daily-limit budget)))
+                              (under-budget (< (get total-spent tracking) (get daily-limit budget)))
+                              (saved-amount (if under-budget 
+                                              (- (get daily-limit budget) (get total-spent tracking)) 
+                                              u0)))
+                            (map-set budget-performance user {
+                                periods-tracked: (+ (get periods-tracked current-perf) u1),
+                                periods-under-budget: (+ (get periods-under-budget current-perf) 
+                                                        (if under-budget u1 u0)),
+                                total-saved: (+ (get total-saved current-perf) saved-amount),
+                                avg-utilization: (/ (+ (* (get avg-utilization current-perf) 
+                                                        (get periods-tracked current-perf)) 
+                                                      utilization) 
+                                                   (+ (get periods-tracked current-perf) u1)),
+                                best-period: (if (< utilization (get avg-utilization current-perf)) 
+                                               daily-period 
+                                               (get best-period current-perf))
+                            })
+                            (ok true))
+                    ERR_NOT_FOUND)
+            ERR_NOT_FOUND
+        )
+    )
+)
+
+(define-read-only (get-budget-alerts (user principal))
+    (let ((daily-period (/ burn-block-height u144))
+          (monthly-period (/ burn-block-height u4320)))
+        (match (map-get? user-budgets user)
+            budget
+                (let ((daily-key {user: user, period: daily-period})
+                      (monthly-key {user: user, period: monthly-period}))
+                    (let ((daily-tracking (map-get? budget-tracking daily-key))
+                          (monthly-tracking (map-get? budget-tracking monthly-key)))
+                        {
+                            daily-alert: (match daily-tracking 
+                                           t (> (* (get total-spent t) u100) 
+                                              (* (get daily-limit budget) (get alert-threshold budget)))
+                                           false),
+                            monthly-alert: (match monthly-tracking 
+                                            t (> (* (get total-spent t) u100) 
+                                               (* (get monthly-limit budget) (get alert-threshold budget)))
+                                            false),
+                            daily-exceeded: (match daily-tracking 
+                                             t (get budget-exceeded t) 
+                                             false),
+                            monthly-exceeded: (match monthly-tracking 
+                                               t (get budget-exceeded t) 
+                                               false)
+                        }))
+            {daily-alert: false, monthly-alert: false, daily-exceeded: false, monthly-exceeded: false}
+        )
+    )
+)
+
+(define-read-only (get-budget-performance (user principal))
+    (map-get? budget-performance user)
+)
+
+(define-read-only (calculate-budget-efficiency (user principal))
+    (match (map-get? budget-performance user)
+        perf
+            (let ((success-rate (/ (* (get periods-under-budget perf) u100) (get periods-tracked perf)))
+                  (avg-util (get avg-utilization perf)))
+                {
+                    success-rate: success-rate,
+                    efficiency-score: (/ (+ success-rate (- u100 avg-util)) u2),
+                    total-periods: (get periods-tracked perf),
+                    savings-achieved: (get total-saved perf)
+                })
+        {success-rate: u0, efficiency-score: u0, total-periods: u0, savings-achieved: u0}
+    )
+)
+
+(define-read-only (predict-budget-usage (user principal) (upcoming-transactions uint))
+    (match (map-get? user-stats user)
+        stats
+            (let ((avg-cost (get avg-gas-per-tx stats))
+                  (predicted-cost (* upcoming-transactions avg-cost)))
+                (match (check-budget-status user)
+                    ok-value
+                        {
+                            predicted-cost: predicted-cost,
+                            daily-affordable: (/ (get daily-remaining ok-value) avg-cost),
+                            monthly-affordable: (/ (get monthly-remaining ok-value) avg-cost),
+                            will-exceed-daily: (> predicted-cost (get daily-remaining ok-value)),
+                            will-exceed-monthly: (> predicted-cost (get monthly-remaining ok-value))
+                        }
+                    err-value
+                        {predicted-cost: predicted-cost, daily-affordable: u0, monthly-affordable: u0,
+                         will-exceed-daily: true, will-exceed-monthly: true}))
+        {predicted-cost: u0, daily-affordable: u0, monthly-affordable: u0,
+         will-exceed-daily: false, will-exceed-monthly: false}
     )
 )
