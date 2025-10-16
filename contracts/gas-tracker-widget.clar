@@ -7,10 +7,16 @@
 (define-constant ERR_NO_RECOMMENDATIONS (err u105))
 (define-constant ERR_BUDGET_EXCEEDED (err u106))
 (define-constant ERR_INVALID_PERIOD (err u107))
+(define-constant ERR_INSUFFICIENT_CREDITS (err u108))
+(define-constant ERR_TRANSFER_FAILED (err u109))
+(define-constant ERR_INVALID_RATE (err u110))
 
 (define-data-var total-transactions uint u0)
 (define-data-var total-gas-consumed uint u0)
 (define-data-var contract-enabled bool true)
+(define-data-var credit-exchange-rate uint u100)
+(define-data-var total-credits-issued uint u0)
+(define-data-var total-credits-redeemed uint u0)
 
 (define-map user-stats principal {
     transactions: uint,
@@ -91,6 +97,31 @@
     total-saved: uint,
     avg-utilization: uint,
     best-period: uint
+})
+
+(define-map gas-credits principal {
+    balance: uint,
+    total-purchased: uint,
+    total-redeemed: uint,
+    last-purchase: uint,
+    last-redemption: uint
+})
+
+(define-map credit-transactions uint {
+    user: principal,
+    transaction-type: (string-ascii 20),
+    amount: uint,
+    rate: uint,
+    timestamp: uint,
+    block-height: uint
+})
+
+(define-map credit-transfers uint {
+    from: principal,
+    to: principal,
+    amount: uint,
+    timestamp: uint,
+    status: (string-ascii 20)
 })
 
 (define-public (track-transaction (function-name (string-ascii 50)) (gas-estimate uint) (actual-cost uint))
@@ -666,5 +697,205 @@
                          will-exceed-daily: true, will-exceed-monthly: true}))
         {predicted-cost: u0, daily-affordable: u0, monthly-affordable: u0,
          will-exceed-daily: false, will-exceed-monthly: false}
+    )
+)
+
+(define-public (purchase-gas-credits (amount uint))
+    (let ((current-rate (var-get credit-exchange-rate))
+          (tx-id (var-get total-transactions)))
+        (begin
+            (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+            (asserts! (var-get contract-enabled) ERR_UNAUTHORIZED)
+            
+            (let ((current-credits (default-to 
+                                     {balance: u0, total-purchased: u0, total-redeemed: u0,
+                                      last-purchase: u0, last-redemption: u0}
+                                     (map-get? gas-credits tx-sender))))
+                (begin
+                    (map-set gas-credits tx-sender {
+                        balance: (+ (get balance current-credits) amount),
+                        total-purchased: (+ (get total-purchased current-credits) amount),
+                        total-redeemed: (get total-redeemed current-credits),
+                        last-purchase: burn-block-height,
+                        last-redemption: (get last-redemption current-credits)
+                    })
+                    
+                    (map-set credit-transactions tx-id {
+                        user: tx-sender,
+                        transaction-type: "purchase",
+                        amount: amount,
+                        rate: current-rate,
+                        timestamp: burn-block-height,
+                        block-height: stacks-block-height
+                    })
+                    
+                    (var-set total-credits-issued (+ (var-get total-credits-issued) amount))
+                    (ok amount)
+                )
+            )
+        )
+    )
+)
+
+(define-public (redeem-gas-credits (amount uint))
+    (let ((user-credits (map-get? gas-credits tx-sender))
+          (current-rate (var-get credit-exchange-rate))
+          (tx-id (var-get total-transactions)))
+        (match user-credits
+            credits
+                (begin
+                    (asserts! (>= (get balance credits) amount) ERR_INSUFFICIENT_CREDITS)
+                    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+                    
+                    (map-set gas-credits tx-sender {
+                        balance: (- (get balance credits) amount),
+                        total-purchased: (get total-purchased credits),
+                        total-redeemed: (+ (get total-redeemed credits) amount),
+                        last-purchase: (get last-purchase credits),
+                        last-redemption: burn-block-height
+                    })
+                    
+                    (map-set credit-transactions tx-id {
+                        user: tx-sender,
+                        transaction-type: "redemption",
+                        amount: amount,
+                        rate: current-rate,
+                        timestamp: burn-block-height,
+                        block-height: stacks-block-height
+                    })
+                    
+                    (var-set total-credits-redeemed (+ (var-get total-credits-redeemed) amount))
+                    (ok amount)
+                )
+            ERR_INSUFFICIENT_CREDITS
+        )
+    )
+)
+
+(define-public (transfer-gas-credits (recipient principal) (amount uint))
+    (let ((sender-credits (map-get? gas-credits tx-sender))
+          (transfer-id (var-get total-credits-issued)))
+        (match sender-credits
+            credits
+                (begin
+                    (asserts! (>= (get balance credits) amount) ERR_INSUFFICIENT_CREDITS)
+                    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+                    (asserts! (not (is-eq tx-sender recipient)) ERR_INVALID_AMOUNT)
+                    
+                    (map-set gas-credits tx-sender {
+                        balance: (- (get balance credits) amount),
+                        total-purchased: (get total-purchased credits),
+                        total-redeemed: (get total-redeemed credits),
+                        last-purchase: (get last-purchase credits),
+                        last-redemption: (get last-redemption credits)
+                    })
+                    
+                    (let ((recipient-credits (default-to 
+                                               {balance: u0, total-purchased: u0, total-redeemed: u0,
+                                                last-purchase: u0, last-redemption: u0}
+                                               (map-get? gas-credits recipient))))
+                        (map-set gas-credits recipient {
+                            balance: (+ (get balance recipient-credits) amount),
+                            total-purchased: (get total-purchased recipient-credits),
+                            total-redeemed: (get total-redeemed recipient-credits),
+                            last-purchase: (get last-purchase recipient-credits),
+                            last-redemption: (get last-redemption recipient-credits)
+                        })
+                    )
+                    
+                    (map-set credit-transfers transfer-id {
+                        from: tx-sender,
+                        to: recipient,
+                        amount: amount,
+                        timestamp: burn-block-height,
+                        status: "completed"
+                    })
+                    
+                    (ok amount)
+                )
+            ERR_INSUFFICIENT_CREDITS
+        )
+    )
+)
+
+(define-public (update-credit-exchange-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-rate u0) ERR_INVALID_RATE)
+        (var-set credit-exchange-rate new-rate)
+        (ok new-rate)
+    )
+)
+
+(define-read-only (get-gas-credits (user principal))
+    (map-get? gas-credits user)
+)
+
+(define-read-only (get-credit-transaction (tx-id uint))
+    (map-get? credit-transactions tx-id)
+)
+
+(define-read-only (get-credit-transfer (transfer-id uint))
+    (map-get? credit-transfers transfer-id)
+)
+
+(define-read-only (get-credit-system-stats)
+    {
+        total-issued: (var-get total-credits-issued),
+        total-redeemed: (var-get total-credits-redeemed),
+        credits-in-circulation: (- (var-get total-credits-issued) (var-get total-credits-redeemed)),
+        current-exchange-rate: (var-get credit-exchange-rate)
+    }
+)
+
+(define-read-only (calculate-credit-value (credits uint))
+    (let ((current-rate (var-get credit-exchange-rate)))
+        {
+            credit-amount: credits,
+            gas-equivalent: (/ (* credits u100) current-rate),
+            current-rate: current-rate
+        }
+    )
+)
+
+(define-read-only (get-user-credit-stats (user principal))
+    (match (map-get? gas-credits user)
+        credits
+            {
+                current-balance: (get balance credits),
+                lifetime-purchased: (get total-purchased credits),
+                lifetime-redeemed: (get total-redeemed credits),
+                net-savings: (let ((purchased-value (* (get total-purchased credits) (var-get credit-exchange-rate)))
+                                   (redeemed-value (* (get total-redeemed credits) u100)))
+                               (if (> redeemed-value purchased-value)
+                                 (- redeemed-value purchased-value)
+                                 u0)),
+                last-activity: (if (> (get last-purchase credits) (get last-redemption credits))
+                                 (get last-purchase credits)
+                                 (get last-redemption credits))
+            }
+        {current-balance: u0, lifetime-purchased: u0, lifetime-redeemed: u0, 
+         net-savings: u0, last-activity: u0}
+    )
+)
+
+(define-read-only (estimate-credit-purchase-savings (amount uint))
+    (let ((current-rate (var-get credit-exchange-rate))
+          (network-congestion (get-network-congestion-level)))
+        (let ((market-gas-cost (* amount u120))
+              (credit-gas-cost (* amount current-rate)))
+            {
+                credits-to-purchase: amount,
+                market-cost: market-gas-cost,
+                credit-cost: credit-gas-cost,
+                potential-savings: (if (> market-gas-cost credit-gas-cost)
+                                     (- market-gas-cost credit-gas-cost)
+                                     u0),
+                savings-percentage: (if (> market-gas-cost u0)
+                                      (/ (* (- market-gas-cost credit-gas-cost) u100) market-gas-cost)
+                                      u0),
+                recommended: (> network-congestion u70)
+            }
+        )
     )
 )
