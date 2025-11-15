@@ -11,6 +11,8 @@
 (define-constant ERR_TRANSFER_FAILED (err u109))
 (define-constant ERR_INVALID_RATE (err u110))
 
+(define-constant ERR_CATEGORY_EXISTS (err u111))
+
 (define-data-var total-transactions uint u0)
 (define-data-var total-gas-consumed uint u0)
 (define-data-var contract-enabled bool true)
@@ -898,4 +900,54 @@
             }
         )
     )
+)
+
+(define-map transaction-categories uint {
+    user: principal,
+    category: (string-ascii 30)
+})
+
+(define-map category-stats (string-ascii 30) {
+    tx-count: uint,
+    total-gas: uint,
+    avg-cost: uint
+})
+
+(define-public (assign-transaction-category (tx-id uint) (category (string-ascii 30)))
+    (let ((existing (map-get? transaction-categories tx-id)))
+        (match existing
+            rec ERR_CATEGORY_EXISTS
+            (match (map-get? transaction-history tx-id)
+                t
+                    (begin
+                        (asserts! (is-eq tx-sender (get sender t)) ERR_UNAUTHORIZED)
+                        (asserts! (> (len category) u0) ERR_INVALID_AMOUNT)
+                        (map-set transaction-categories tx-id {
+                            user: tx-sender,
+                            category: category
+                        })
+                        (let ((stats (default-to {tx-count: u0, total-gas: u0, avg-cost: u0}
+                                                 (map-get? category-stats category)))
+                              (new-count (+ (get tx-count stats) u1))
+                              (new-total (+ (get total-gas stats) (get actual-cost t))))
+                            (map-set category-stats category {
+                                tx-count: new-count,
+                                total-gas: new-total,
+                                avg-cost: (/ new-total new-count)
+                            })
+                            (ok true)
+                        )
+                    )
+                ERR_NOT_FOUND
+            )
+        )
+    )
+)
+
+(define-read-only (get-transaction-category (tx-id uint))
+    (map-get? transaction-categories tx-id)
+)
+
+(define-read-only (get-category-stats (category (string-ascii 30)))
+    (map-get? category-stats category)
 )
