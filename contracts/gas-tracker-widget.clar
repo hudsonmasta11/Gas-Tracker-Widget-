@@ -12,6 +12,7 @@
 (define-constant ERR_INVALID_RATE (err u110))
 
 (define-constant ERR_CATEGORY_EXISTS (err u111))
+(define-constant ERR_INSUFFICIENT_STAKE (err u112))
 
 (define-data-var total-transactions uint u0)
 (define-data-var total-gas-consumed uint u0)
@@ -107,6 +108,12 @@
     total-redeemed: uint,
     last-purchase: uint,
     last-redemption: uint
+})
+
+(define-map credit-stakes principal {
+    staked: uint,
+    stake-start: uint,
+    last-update: uint
 })
 
 (define-map credit-transactions uint {
@@ -950,4 +957,81 @@
 
 (define-read-only (get-category-stats (category (string-ascii 30)))
     (map-get? category-stats category)
+)
+
+(define-public (stake-gas-credits (amount uint))
+    (let ((user-credits (map-get? gas-credits tx-sender))
+          (current-stake (default-to 
+                           {staked: u0, stake-start: u0, last-update: u0}
+                           (map-get? credit-stakes tx-sender))))
+        (match user-credits
+            credits
+                (begin
+                    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+                    (asserts! (>= (get balance credits) amount) ERR_INSUFFICIENT_CREDITS)
+                    (map-set gas-credits tx-sender {
+                        balance: (- (get balance credits) amount),
+                        total-purchased: (get total-purchased credits),
+                        total-redeemed: (get total-redeemed credits),
+                        last-purchase: (get last-purchase credits),
+                        last-redemption: (get last-redemption credits)
+                    })
+                    (map-set credit-stakes tx-sender {
+                        staked: (+ (get staked current-stake) amount),
+                        stake-start: (if (> (get staked current-stake) u0) (get stake-start current-stake) burn-block-height),
+                        last-update: burn-block-height
+                    })
+                    (ok amount)
+                )
+            ERR_INSUFFICIENT_CREDITS
+        )
+    )
+)
+
+(define-public (unstake-gas-credits (amount uint))
+    (let ((stake (map-get? credit-stakes tx-sender))
+          (current-credits (default-to 
+                             {balance: u0, total-purchased: u0, total-redeemed: u0,
+                              last-purchase: u0, last-redemption: u0}
+                             (map-get? gas-credits tx-sender))))
+        (match stake
+            s
+                (begin
+                    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+                    (asserts! (>= (get staked s) amount) ERR_INSUFFICIENT_STAKE)
+                    (map-set credit-stakes tx-sender {
+                        staked: (- (get staked s) amount),
+                        stake-start: (get stake-start s),
+                        last-update: burn-block-height
+                    })
+                    (map-set gas-credits tx-sender {
+                        balance: (+ (get balance current-credits) amount),
+                        total-purchased: (get total-purchased current-credits),
+                        total-redeemed: (get total-redeemed current-credits),
+                        last-purchase: (get last-purchase current-credits),
+                        last-redemption: (get last-redemption current-credits)
+                    })
+                    (ok amount)
+                )
+            ERR_NOT_FOUND
+        )
+    )
+)
+
+(define-read-only (get-stake (user principal))
+    (map-get? credit-stakes user)
+)
+
+(define-read-only (get-stake-benefits (user principal))
+    (match (map-get? credit-stakes user)
+        s
+            {
+                staked: (get staked s),
+                discount: (let ((amt (get staked s)))
+                              (if (>= amt u1000) u20
+                              (if (>= amt u500) u10
+                              (if (>= amt u100) u5 u0))))
+            }
+        {staked: u0, discount: u0}
+    )
 )
